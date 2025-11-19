@@ -7,7 +7,7 @@ spark = (
     .getOrCreate()
 )
 
-# Silencia o spark
+# Silencia os logs verbosos do Spark (deixa só erro)
 spark.sparkContext.setLogLevel("ERROR")
 
 # ================== CARREGAR DATASET ==================
@@ -34,6 +34,15 @@ type_counts.show(truncate=False)
 # ================== SEPARAR FILMES E SÉRIES ==================
 movies = df.filter(F.col("type") == "Movie")
 series = df.filter(F.col("type") == "TV Show")
+
+# ================== VALORES VÁLIDOS DE RATING ==================
+valid_ratings = [
+    "TV-MA", "TV-14", "TV-PG", "TV-Y", "TV-Y7", "TV-Y7-FV",
+    "TV-G", "G", "PG", "PG-13", "R", "NC-17", "NR", "UR"
+]
+
+movies_for_ratings = movies.filter(F.col("rating").isin(valid_ratings))
+series_for_ratings = series.filter(F.col("rating").isin(valid_ratings))
 
 # --------------------------------------------------------------------
 # 1) ANÁLISE DE FILMES
@@ -67,9 +76,9 @@ movie_countries = (
 print("\n\n================== PAÍSES COM MAIS FILMES ==================")
 movie_countries.show(10, truncate=False)
 
-# --------- Ratings mais comuns em filmes ---------
+# --------- Ratings mais comuns em filmes (APENAS VÁLIDOS) ---------
 movie_ratings = (
-    movies
+    movies_for_ratings
     .groupBy("rating")
     .count()
     .orderBy(F.desc("count"))
@@ -79,7 +88,6 @@ print("\n\n================== RATINGS MAIS COMUNS EM FILMES ==================")
 movie_ratings.show(10, truncate=False)
 
 # --------- Duração média dos filmes (minutos) ---------
-# 🔧 AQUI ESTAVA O PROBLEMA: cast("") -> int
 movies_with_duration = (
     movies
     .withColumn("duration_str", F.regexp_extract("duration", r"(\d+)", 1))
@@ -98,10 +106,15 @@ avg_movie_duration_row = (
     .first()
 )
 
-avg_movie_duration = int(round(avg_movie_duration_row["avg_duration"])) if avg_movie_duration_row["avg_duration"] is not None else 0
+avg_movie_duration_exact = avg_movie_duration_row["avg_duration"]
+avg_movie_duration = int(round(avg_movie_duration_exact)) if avg_movie_duration_exact is not None else 0
 
 print("\n\n================== DURAÇÃO MÉDIA DOS FILMES (min) ==================")
-print(f"Duração média aproximada dos filmes: {avg_movie_duration} minutos\n")
+if avg_movie_duration_exact is not None:
+    print(f"Duração média exata dos filmes: {avg_movie_duration_exact:.2f} minutos")
+    print(f"Duração média aproximada (arredondada): {avg_movie_duration} minutos\n")
+else:
+    print("Não foi possível calcular a duração média (dados ausentes).\n")
 
 # --------------------------------------------------------------------
 # 2) ANÁLISE DE SÉRIES
@@ -135,9 +148,9 @@ series_countries = (
 print("\n\n================== PAÍSES COM MAIS SÉRIES ==================")
 series_countries.show(10, truncate=False)
 
-# --------- Ratings mais comuns em séries ---------
+# --------- Ratings mais comuns em séries (APENAS VÁLIDOS) ---------
 series_ratings = (
-    series
+    series_for_ratings
     .groupBy("rating")
     .count()
     .orderBy(F.desc("count"))
@@ -147,14 +160,13 @@ print("\n\n================== RATINGS MAIS COMUNS EM SÉRIES =================="
 series_ratings.show(10, truncate=False)
 
 # --------- Número médio de temporadas ---------
-# duração vem como "X Seasons" ou "1 Season"
 series_with_seasons = (
     series
-    .withColumn("seasons_str",
-                F.regexp_extract("duration", r"(\d+)", 1))
+    .withColumn("seasons_str", F.regexp_extract("duration", r"(\d+)", 1))
     .withColumn(
         "seasons_num",
-        F.when(F.col("seasons_str") != "", F.col("seasons_str").cast("int"))
+        F.when(F.col("seasons_str").rlike("^[0-9]+$"),
+               F.col("seasons_str").cast("int"))
          .otherwise(F.lit(None).cast("int"))
     )
 )
@@ -165,16 +177,21 @@ avg_seasons_row = (
     .first()
 )
 
-avg_seasons = int(round(avg_seasons_row["avg_seasons"])) if avg_seasons_row["avg_seasons"] is not None else 0
+avg_seasons_exact = avg_seasons_row["avg_seasons"]
+avg_seasons = int(round(avg_seasons_exact)) if avg_seasons_exact is not None else 0
 
 print("\n\n================== NÚMERO MÉDIO DE TEMPORADAS ==================")
-print(f"Número médio aproximado de temporadas: {avg_seasons}\n")
+if avg_seasons_exact is not None:
+    print(f"Número médio exato de temporadas: {avg_seasons_exact:.2f}")
+    print(f"Número médio aproximado de temporadas: {avg_seasons}\n")
+else:
+    print("Não foi possível calcular o número médio de temporadas.\n")
 
 # --------------------------------------------------------------------
 # 3) CRIAÇÃO DE FILME E SÉRIE HIPOTÉTICOS
 # --------------------------------------------------------------------
 
-# Pegar top 1 de cada agrupamento para guiar a sugestão
+# Top 1 de cada agrupamento para guiar a sugestão
 top_movie_genre_row = movie_genres.first()
 top_movie_country_row = movie_countries.first()
 top_movie_rating_row = movie_ratings.first()
@@ -234,8 +251,8 @@ print(f"- Temporadas: '{avg_seasons}' foi definido a partir da média de tempora
 print(f"- Rating: '{top_series_rating}' segue a classificação com maior frequência em séries.\n")
 
 print("Conteúdo (ideia):")
-print("Uma série dramática contemporânea em {0}, com arcos planejados para".format(top_series_country))
-print("cerca de {0} temporadas, explorando temas típicos das produções mais populares".format(avg_seasons))
+print(f"Uma série dramática contemporânea em {top_series_country}, com arcos planejados para")
+print(f"cerca de {avg_seasons} temporadas, explorando temas típicos das produções mais populares")
 print("do catálogo nesse gênero.\n")
 
 # --------------------------------------------------------------------
@@ -271,7 +288,6 @@ real_movie = (
     .select("title", "country", "listed_in", "rating", "duration", "release_year_int")
     .first()
 )
-
 
 if real_movie:
     print(f"Título: {real_movie['title']}")
@@ -313,7 +329,6 @@ real_series = (
     .select("title", "country", "listed_in", "rating", "duration", "release_year_int")
     .first()
 )
-
 
 if real_series:
     print(f"Título: {real_series['title']}")

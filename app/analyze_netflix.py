@@ -1,265 +1,330 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, split, explode, trim, count, desc,
-    regexp_extract, avg
-)
+# analyze_netflix.py
+from pyspark.sql import SparkSession, functions as F
 
-# -----------------------------------------------------------------------------
-# 1) Criar sessão Spark
-# -----------------------------------------------------------------------------
 spark = (
     SparkSession.builder
     .appName("NetflixAnalysis")
     .getOrCreate()
 )
 
-# ↓↓↓ MENOS LIXO NO TERMINAL ↓↓↓
-spark.sparkContext.setLogLevel("WARN")
+# Silencia o spark
+spark.sparkContext.setLogLevel("ERROR")
 
-# -----------------------------------------------------------------------------
-# 2) Ler dataset
-# -----------------------------------------------------------------------------
-file_path = "/opt/spark/data/netflix_titles.csv"
-
+# ================== CARREGAR DATASET ==================
 df = (
     spark.read
-    .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(file_path)
+    .option("header", True)
+    .option("inferSchema", False)
+    .csv("/opt/spark/data/netflix_titles.csv")
+    .filter(F.length(F.trim(F.col("show_id"))) > 0)
 )
 
 print("\n====================== ESQUEMA DO DATASET ======================")
 df.printSchema()
 
-print("\n================== CONTAGEM POR TIPO (Movie x TV Show) ==================")
-df.groupBy("type").count().show(truncate=False)
-
-# -----------------------------------------------------------------------------
-# 3) Explodir gêneros (listed_in) e países (country)
-# -----------------------------------------------------------------------------
-genre_df = (
-    df
-    .withColumn("genre", explode(split(col("listed_in"), ",")))
-    .withColumn("genre", trim(col("genre")))
+# ================== CONTAGEM POR TIPO ==================
+print("\n\n================== CONTAGEM POR TIPO (Movie x TV Show) ==================")
+type_counts = (
+    df.groupBy("type")
+      .count()
+      .orderBy(F.desc("count"))
 )
+type_counts.show(truncate=False)
 
-country_df = (
-    df
-    .withColumn("country_exploded", explode(split(col("country"), ",")))
-    .withColumn("country_exploded", trim(col("country_exploded")))
-)
+# ================== SEPARAR FILMES E SÉRIES ==================
+movies = df.filter(F.col("type") == "Movie")
+series = df.filter(F.col("type") == "TV Show")
 
-# -----------------------------------------------------------------------------
-# 4) Estatísticas para FILMES
-# -----------------------------------------------------------------------------
-movies_df = df.filter(col("type") == "Movie")
+# --------------------------------------------------------------------
+# 1) ANÁLISE DE FILMES
+# --------------------------------------------------------------------
 
-print("\n================== GÊNEROS MAIS FREQUENTES EM FILMES ==================")
+# --------- Gêneros mais frequentes em filmes ---------
 movie_genres = (
-    genre_df
-    .filter(col("type") == "Movie")
+    movies
+    .withColumn("genre", F.explode(F.split(F.col("listed_in"), ",")))
+    .withColumn("genre", F.trim("genre"))
+    .filter(F.col("genre") != "")
     .groupBy("genre")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
+    .count()
+    .orderBy(F.desc("count"))
 )
+
+print("\n\n================== GÊNEROS MAIS FREQUENTES EM FILMES ==================")
 movie_genres.show(10, truncate=False)
 
-top_movie_genre_row = movie_genres.first()
-top_movie_genre = top_movie_genre_row["genre"] if top_movie_genre_row else "Drama"
-
-print("\n================== PAÍSES COM MAIS FILMES ==================")
+# --------- Países com mais filmes ---------
 movie_countries = (
-    country_df
-    .filter(col("type") == "Movie")
+    movies
+    .withColumn("country_exploded", F.explode(F.split(F.col("country"), ",")))
+    .withColumn("country_exploded", F.trim("country_exploded"))
+    .filter(F.col("country_exploded") != "")
     .groupBy("country_exploded")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
+    .count()
+    .orderBy(F.desc("count"))
 )
+
+print("\n\n================== PAÍSES COM MAIS FILMES ==================")
 movie_countries.show(10, truncate=False)
 
-top_movie_country_row = movie_countries.first()
-top_movie_country = (
-    top_movie_country_row["country_exploded"]
-    if top_movie_country_row else "United States"
+# --------- Ratings mais comuns em filmes ---------
+movie_ratings = (
+    movies
+    .groupBy("rating")
+    .count()
+    .orderBy(F.desc("count"))
 )
 
-print("\n================== RATINGS MAIS COMUNS EM FILMES ==================")
-movie_ratings = (
-    movies_df
-    .groupBy("rating")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
-)
+print("\n\n================== RATINGS MAIS COMUNS EM FILMES ==================")
 movie_ratings.show(10, truncate=False)
 
-top_movie_rating_row = movie_ratings.first()
-top_movie_rating = top_movie_rating_row["rating"] if top_movie_rating_row else "PG-13"
-
-# ---- DURAÇÃO MÉDIA DOS FILMES (tratando campos vazios) ---------------------
-movies_with_minutes = (
-    movies_df
-    # extrai apenas o número de "90 min"
-    .withColumn("duration_min_str", regexp_extract(col("duration"), r"(\\d+)", 1))
-    # ignora linhas onde não achou número
-    .filter(col("duration_min_str") != "")
-    .withColumn("duration_min", col("duration_min_str").cast("int"))
+# --------- Duração média dos filmes (minutos) ---------
+# 🔧 AQUI ESTAVA O PROBLEMA: cast("") -> int
+movies_with_duration = (
+    movies
+    .withColumn("duration_str", F.regexp_extract("duration", r"(\d+)", 1))
+    .withColumn(
+        "duration_num",
+        F.when(
+            F.col("duration_str").rlike("^[0-9]+$"),
+            F.col("duration_str").cast("int")
+        ).otherwise(F.lit(None).cast("int"))
+    )
 )
 
 avg_movie_duration_row = (
-    movies_with_minutes
-    .agg(avg("duration_min").alias("avg_min"))
+    movies_with_duration
+    .select(F.avg("duration_num").alias("avg_duration"))
     .first()
 )
 
-avg_movie_duration = (
-    int(avg_movie_duration_row["avg_min"])
-    if avg_movie_duration_row and avg_movie_duration_row["avg_min"] is not None
-    else 100
-)
+avg_movie_duration = int(round(avg_movie_duration_row["avg_duration"])) if avg_movie_duration_row["avg_duration"] is not None else 0
 
-print("\n================== DURAÇÃO MÉDIA DOS FILMES (min) ==================")
-print(f"Duração média aproximada dos filmes: {avg_movie_duration} minutos")
+print("\n\n================== DURAÇÃO MÉDIA DOS FILMES (min) ==================")
+print(f"Duração média aproximada dos filmes: {avg_movie_duration} minutos\n")
 
-# -----------------------------------------------------------------------------
-# 5) Estatísticas para SÉRIES (TV Shows)
-# -----------------------------------------------------------------------------
-shows_df = df.filter(col("type") == "TV Show")
+# --------------------------------------------------------------------
+# 2) ANÁLISE DE SÉRIES
+# --------------------------------------------------------------------
 
-print("\n================== GÊNEROS MAIS FREQUENTES EM SÉRIES ==================")
-tv_genres = (
-    genre_df
-    .filter(col("type") == "TV Show")
+# --------- Gêneros mais frequentes em séries ---------
+series_genres = (
+    series
+    .withColumn("genre", F.explode(F.split(F.col("listed_in"), ",")))
+    .withColumn("genre", F.trim("genre"))
+    .filter(F.col("genre") != "")
     .groupBy("genre")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
+    .count()
+    .orderBy(F.desc("count"))
 )
-tv_genres.show(10, truncate=False)
 
-top_tv_genre_row = tv_genres.first()
-top_tv_genre = top_tv_genre_row["genre"] if top_tv_genre_row else "TV Dramas"
+print("\n\n================== GÊNEROS MAIS FREQUENTES EM SÉRIES ==================")
+series_genres.show(10, truncate=False)
 
-print("\n================== PAÍSES COM MAIS SÉRIES ==================")
-tv_countries = (
-    country_df
-    .filter(col("type") == "TV Show")
+# --------- Países com mais séries ---------
+series_countries = (
+    series
+    .withColumn("country_exploded", F.explode(F.split(F.col("country"), ",")))
+    .withColumn("country_exploded", F.trim("country_exploded"))
+    .filter(F.col("country_exploded") != "")
     .groupBy("country_exploded")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
-)
-tv_countries.show(10, truncate=False)
-
-top_tv_country_row = tv_countries.first()
-top_tv_country = (
-    top_tv_country_row["country_exploded"]
-    if top_tv_country_row else "United States"
+    .count()
+    .orderBy(F.desc("count"))
 )
 
-print("\n================== RATINGS MAIS COMUNS EM SÉRIES ==================")
-tv_ratings = (
-    shows_df
+print("\n\n================== PAÍSES COM MAIS SÉRIES ==================")
+series_countries.show(10, truncate=False)
+
+# --------- Ratings mais comuns em séries ---------
+series_ratings = (
+    series
     .groupBy("rating")
-    .agg(count("*").alias("count"))
-    .orderBy(desc("count"))
-)
-tv_ratings.show(10, truncate=False)
-
-top_tv_rating_row = tv_ratings.first()
-top_tv_rating = top_tv_rating_row["rating"] if top_tv_rating_row else "TV-14"
-
-# ---- NÚMERO MÉDIO DE TEMPORADAS (tratando campos vazios) -------------------
-shows_with_seasons = (
-    shows_df
-    .withColumn("seasons_str", regexp_extract(col("duration"), r"(\\d+)", 1))
-    .filter(col("seasons_str") != "")
-    .withColumn("seasons", col("seasons_str").cast("int"))
+    .count()
+    .orderBy(F.desc("count"))
 )
 
-avg_seasons_row = shows_with_seasons.agg(avg("seasons").alias("avg_seasons")).first()
-avg_seasons = (
-    int(avg_seasons_row["avg_seasons"])
-    if avg_seasons_row and avg_seasons_row["avg_seasons"] is not None
-    else 2
+print("\n\n================== RATINGS MAIS COMUNS EM SÉRIES ==================")
+series_ratings.show(10, truncate=False)
+
+# --------- Número médio de temporadas ---------
+# duração vem como "X Seasons" ou "1 Season"
+series_with_seasons = (
+    series
+    .withColumn("seasons_str",
+                F.regexp_extract("duration", r"(\d+)", 1))
+    .withColumn(
+        "seasons_num",
+        F.when(F.col("seasons_str") != "", F.col("seasons_str").cast("int"))
+         .otherwise(F.lit(None).cast("int"))
+    )
 )
 
-print("\n================== NÚMERO MÉDIO DE TEMPORADAS ==================")
-print(f"Número médio aproximado de temporadas: {avg_seasons}")
+avg_seasons_row = (
+    series_with_seasons
+    .select(F.avg("seasons_num").alias("avg_seasons"))
+    .first()
+)
 
-# -----------------------------------------------------------------------------
-# 6) Criar FILME hipotético com base nas análises
-# -----------------------------------------------------------------------------
-hyp_movie = {
-    "title": "Sombras em " + top_movie_country,
-    "type": "Movie",
-    "main_genre": top_movie_genre,
-    "country": top_movie_country,
-    "average_duration_min": avg_movie_duration,
-    "rating": top_movie_rating,
-    "year": 2025,
-}
+avg_seasons = int(round(avg_seasons_row["avg_seasons"])) if avg_seasons_row["avg_seasons"] is not None else 0
 
-hyp_movie_description = f"""
-================== FILME HIPOTÉTICO (BASEADO NO DATASET) ==================
+print("\n\n================== NÚMERO MÉDIO DE TEMPORADAS ==================")
+print(f"Número médio aproximado de temporadas: {avg_seasons}\n")
 
-Título: {hyp_movie['title']}
-Tipo: {hyp_movie['type']}
-Gênero principal: {hyp_movie['main_genre']}
-País de produção: {hyp_movie['country']}
-Duração aproximada: {hyp_movie['average_duration_min']} minutos
-Classificação indicativa: {hyp_movie['rating']}
-Ano de lançamento: {hyp_movie['year']}
+# --------------------------------------------------------------------
+# 3) CRIAÇÃO DE FILME E SÉRIE HIPOTÉTICOS
+# --------------------------------------------------------------------
 
-Justificativa:
-- Gênero escolhido: '{hyp_movie['main_genre']}' é o gênero de filme mais frequente no dataset.
-- País: '{hyp_movie['country']}' aparece entre os que mais produzem filmes na base.
-- Duração: usamos a média de duração dos filmes calculada via Spark (coluna 'duration').
-- Rating: '{hyp_movie['rating']}' está entre as classificações mais comuns nos filmes.
+# Pegar top 1 de cada agrupamento para guiar a sugestão
+top_movie_genre_row = movie_genres.first()
+top_movie_country_row = movie_countries.first()
+top_movie_rating_row = movie_ratings.first()
 
-Conteúdo (ideia):
-Um filme voltado ao público que mais consome esse tipo de produção na plataforma, 
-aproveitando o gênero e o país que já têm alta aceitação, mas com uma narrativa original.
-"""
+top_movie_genre = top_movie_genre_row["genre"] if top_movie_genre_row else "International Movies"
+top_movie_country = top_movie_country_row["country_exploded"] if top_movie_country_row else "United States"
+top_movie_rating = top_movie_rating_row["rating"] if top_movie_rating_row else "TV-MA"
 
-# -----------------------------------------------------------------------------
-# 7) Criar SÉRIE hipotética com base nas análises
-# -----------------------------------------------------------------------------
-hyp_series = {
-    "title": "Conexões em " + top_tv_country,
-    "type": "TV Show",
-    "main_genre": top_tv_genre,
-    "country": top_tv_country,
-    "seasons": avg_seasons,
-    "rating": top_tv_rating,
-    "year": 2025,
-}
+top_series_genre_row = series_genres.first()
+top_series_country_row = series_countries.first()
+top_series_rating_row = series_ratings.first()
 
-hyp_series_description = f"""
-================== SÉRIE HIPOTÉTICA (BASEADA NO DATASET) ==================
+top_series_genre = top_series_genre_row["genre"] if top_series_genre_row else "International TV Shows"
+top_series_country = top_series_country_row["country_exploded"] if top_series_country_row else "United States"
+top_series_rating = top_series_rating_row["rating"] if top_series_rating_row else "TV-MA"
 
-Título: {hyp_series['title']}
-Tipo: {hyp_series['type']}
-Gênero principal: {hyp_series['main_genre']}
-País de produção: {hyp_series['country']}
-Número previsto de temporadas: {hyp_series['seasons']}
-Classificação indicativa: {hyp_series['rating']}
-Ano de lançamento: {hyp_series['year']}
+# --------- FILME HIPOTÉTICO ---------
+print("\n\n================== FILME HIPOTÉTICO (BASEADO NO DATASET) ==================\n")
 
-Justificativa:
-- Gênero: '{hyp_series['main_genre']}' está entre os gêneros mais recorrentes em séries na base.
-- País: '{hyp_series['country']}' é um dos principais produtores de séries na Netflix.
-- Temporadas: '{hyp_series['seasons']}' foi definido a partir da média de temporadas observada 
-  na coluna 'duration' (ex.: "3 Seasons").
-- Rating: '{hyp_series['rating']}' segue a classificação com maior frequência em séries.
+hyp_movie_title = f"Sombras em {top_movie_country}"
 
-Conteúdo (ideia):
-Uma série dramática contemporânea em {hyp_series['country']}, com arcos planejados para 
-cerca de {hyp_series['seasons']} temporadas, explorando temas típicos das produções mais populares 
-do catálogo nesse gênero.
-"""
+print(f"Título: {hyp_movie_title}")
+print("Tipo: Movie")
+print(f"Gênero principal: {top_movie_genre}")
+print(f"País de produção: {top_movie_country}")
+print(f"Duração aproximada: {avg_movie_duration} minutos")
+print(f"Classificação indicativa: {top_movie_rating}")
+print("Ano de lançamento: 2025\n")
 
-# -----------------------------------------------------------------------------
-# 8) Exibir resultados finais organizados
-# -----------------------------------------------------------------------------
-print(hyp_movie_description)
-print(hyp_series_description)
+print("Justificativa:")
+print(f"- Gênero escolhido: '{top_movie_genre}' está entre os gêneros de filme mais frequentes no dataset.")
+print(f"- País: '{top_movie_country}' aparece entre os países que mais produzem filmes na base.")
+print("- Duração: usamos a média de duração dos filmes calculada via Spark (coluna 'duration').")
+print(f"- Rating: '{top_movie_rating}' está entre as classificações mais comuns nos filmes.\n")
+
+print("Conteúdo (ideia):")
+print("Um filme voltado ao público que mais consome esse tipo de produção na plataforma,")
+print("aproveitando o gênero e o país que já têm alta aceitação, mas com uma narrativa original.\n")
+
+# --------- SÉRIE HIPOTÉTICA ---------
+print("\n================== SÉRIE HIPOTÉTICA (BASEADA NO DATASET) ==================\n")
+
+hyp_series_title = f"Conexões em {top_series_country}"
+
+print(f"Título: {hyp_series_title}")
+print("Tipo: TV Show")
+print(f"Gênero principal: {top_series_genre}")
+print(f"País de produção: {top_series_country}")
+print(f"Número previsto de temporadas: {avg_seasons}")
+print(f"Classificação indicativa: {top_series_rating}")
+print("Ano de lançamento: 2025\n")
+
+print("Justificativa:")
+print(f"- Gênero: '{top_series_genre}' aparece entre os gêneros mais recorrentes em séries na base.")
+print(f"- País: '{top_series_country}' é um dos principais produtores de séries na Netflix.")
+print(f"- Temporadas: '{avg_seasons}' foi definido a partir da média de temporadas observada na coluna 'duration'.")
+print(f"- Rating: '{top_series_rating}' segue a classificação com maior frequência em séries.\n")
+
+print("Conteúdo (ideia):")
+print("Uma série dramática contemporânea em {0}, com arcos planejados para".format(top_series_country))
+print("cerca de {0} temporadas, explorando temas típicos das produções mais populares".format(avg_seasons))
+print("do catálogo nesse gênero.\n")
+
+# --------------------------------------------------------------------
+# 4) SUGESTÃO DE FILME REAL E SÉRIE REAL A PARTIR DO DATASET
+# --------------------------------------------------------------------
+
+print("\n================== FILME REAL SUGERIDO (BASEADO NO DATASET) ==================\n")
+
+real_movie_candidates = movies
+
+# tentar aproximar do perfil encontrado (gênero, país, rating)
+real_movie_candidates = real_movie_candidates.filter(
+    F.col("listed_in").contains(top_movie_genre)
+)
+
+real_movie_candidates = real_movie_candidates.filter(
+    F.col("country").contains(top_movie_country)
+)
+
+real_movie_candidates = real_movie_candidates.filter(
+    F.col("rating") == top_movie_rating
+)
+
+real_movie = (
+    real_movie_candidates
+    .withColumn(
+        "release_year_int",
+        F.when(F.col("release_year").rlike("^[0-9]+$"),
+               F.col("release_year").cast("int"))
+         .otherwise(F.lit(None).cast("int"))
+    )
+    .orderBy(F.desc("release_year_int"))
+    .select("title", "country", "listed_in", "rating", "duration", "release_year_int")
+    .first()
+)
+
+
+if real_movie:
+    print(f"Título: {real_movie['title']}")
+    print("Tipo: Movie")
+    print(f"País(es): {real_movie['country']}")
+    print(f"Gênero(s): {real_movie['listed_in']}")
+    print(f"Duração: {real_movie['duration']}")
+    print(f"Classificação indicativa: {real_movie['rating']}")
+    print(f"Ano de lançamento: {real_movie['release_year_int']}\n")
+else:
+    print("Não foi possível encontrar um filme com todos os critérios (gênero, país e rating).")
+    print("Ainda assim, os padrões extraídos podem ser usados para guiar decisões de catálogo.\n")
+
+print("\n================== SÉRIE REAL SUGERIDA (BASEADO NO DATASET) ==================\n")
+
+real_series_candidates = series
+
+real_series_candidates = real_series_candidates.filter(
+    F.col("listed_in").contains(top_series_genre)
+)
+
+real_series_candidates = real_series_candidates.filter(
+    F.col("country").contains(top_series_country)
+)
+
+real_series_candidates = real_series_candidates.filter(
+    F.col("rating") == top_series_rating
+)
+
+real_series = (
+    real_series_candidates
+    .withColumn(
+        "release_year_int",
+        F.when(F.col("release_year").rlike("^[0-9]+$"),
+               F.col("release_year").cast("int"))
+         .otherwise(F.lit(None).cast("int"))
+    )
+    .orderBy(F.desc("release_year_int"))
+    .select("title", "country", "listed_in", "rating", "duration", "release_year_int")
+    .first()
+)
+
+
+if real_series:
+    print(f"Título: {real_series['title']}")
+    print("Tipo: TV Show")
+    print(f"País(es): {real_series['country']}")
+    print(f"Gênero(s): {real_series['listed_in']}")
+    print(f"Duração (texto original): {real_series['duration']}")
+    print(f"Classificação indicativa: {real_series['rating']}")
+    print(f"Ano de lançamento: {real_series['release_year_int']}\n")
+else:
+    print("Não foi possível encontrar uma série com todos os critérios (gênero, país e rating).")
+    print("Ainda assim, os padrões extraídos podem ser usados para guiar decisões de catálogo.\n")
 
 spark.stop()
